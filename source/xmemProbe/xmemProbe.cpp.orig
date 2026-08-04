@@ -1,0 +1,545 @@
+// Local RE tooling for the virus-os-decompile project, NOT part of upstream gearmulator.
+//
+// Boots the real DSP56300 TI2 firmware, loads a real factory preset with the Vocoder
+// engaged, lets it run long enough to process notes, then dumps specific X-memory
+// ranges to test the "single-instance, ownership-arbitrated 32-slot harmonic engine"
+// (X:$b52/$b53 claim flags, X:0x49800 32-slot table) hypothesis documented in
+// doc/dsp56300_synth_engine.md. See insights.md for background.
+//
+// Modeled closely on virusConsoleLib/consoleApp.cpp's ConsoleApp::run(), just with a
+// memory dump instead of/after audio rendering.
+
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <vector>
+
+#include "virusConsoleLib/audioProcessor.h"
+
+#include "virusLib/device.h"
+#include "virusLib/microcontroller.h"
+#include "virusLib/romfile.h"
+#include "virusLib/romloader.h"
+
+#include "dsp56kEmu/audio.h"
+#include "dsp56kEmu/memory.h"
+#include "dsp56kBase/semaphore.h"
+
+using namespace virusLib;
+using namespace synthLib;
+
+namespace
+{
+	void dumpRange(const dsp56k::Memory& _mem, dsp56k::EMemArea _area, const char* _areaName, uint32_t _addr, uint32_t _count, std::ostream& _out)
+	{
+		_out << "--- " << _areaName << ":0x" << std::hex << _addr << " (" << std::dec << _count << " words) ---\n";
+		for (uint32_t i = 0; i < _count; ++i)
+		{
+			const auto v = _mem.get(_area, _addr + i);
+			_out << std::hex << std::uppercase;
+			_out << "  " << _areaName << ":$" << (_addr + i) << " = $" << v << "\n";
+		}
+		_out << std::dec;
+	}
+
+	// Walks the active-voice linked list per doc/dsp56300_synth_engine.md's "Active-voice
+	// linked-list traversal" + func_000de0/de1/de2 sections: the confirmed top-level driver
+	// (func_000de0) seeds r1=0 before the *first* iterator call, which reads X:(r1+$1) == X:$1 --
+	// i.e. X:$1 is the real head-of-list global cell (not r1=0x1f38 directly, which is only used
+	// as the mid-loop *reset* value/sentinel). Each subsequent step reads X:(r1+$1) as the current
+	// node's "next" field and advances r1 to it. Termination is genuinely ambiguous between two
+	// documented readings -- func_000113's caller-facing description says "checks r1==0x1f38", but
+	// the concrete func_000de2 driver code tests "a==0" (a is the freshly-read next-pointer value)
+	// -- so this walk defensively treats *either* a 0 or a 0x1f38 next-value as list-end, plus a
+	// visited-set cycle guard, so a wrong assumption here fails safe (stops walking) rather than
+	// looping forever or silently misreporting the count.
+	//
+	// Per-node fields dumped are restricted to offsets this project has actually documented and
+	// traced a read/write for (not guessed): +$1 (next pointer, implicit in the walk itself),
+	// +$2 (the field func_00024c caches into X:$54136 when resolving a voice's primary), +$3 (the
+	// per-voice state/gate field func_000de4 and func_04f630 both touch every tick), +$27 (the
+	// validity/gate field func_000124 checks, also used as a scatter-table index by one
+	// func_00024c caller pattern), and +$126 (the primary-voice back-pointer func_00024c reads and
+	// func_0561ec stamps at voice-duplication time -- the field this whole probe exists to test).
+	void dumpVoiceLinkedList(const dsp56k::Memory& _mem, std::ostream& _out)
+	{
+		constexpr uint32_t kSentinel = 0x1f38;
+		constexpr int kMaxNodes = 64; // guard against a walk bug spinning forever
+
+		_out << "\n--- Active-voice linked-list walk (head cell X:$1, next field node+$1, "
+			"sentinel/reset value X:$1F38) ---\n";
+
+		uint32_t r1 = 0; // bootstrap: X:(0+$1) == X:$1, the documented head-of-list global cell
+		std::vector<uint32_t> visited;
+		int count = 0;
+		for (int i = 0; i < kMaxNodes; ++i)
+		{
+			const uint32_t next = _mem.get(dsp56k::MemArea_X, r1 + 1);
+			_out << "  step " << i << ": read X:$" << std::hex << std::uppercase << (r1 + 1)
+				<< " = $" << next << std::dec << "\n";
+
+			if (next == 0 || next == kSentinel)
+			{
+				_out << "  -- terminator reached (" << (next == 0 ? "0" : "sentinel 0x1F38")
+					<< "), stopping.\n";
+				break;
+			}
+			if (std::find(visited.begin(), visited.end(), next) != visited.end())
+			{
+				_out << "  -- CYCLE DETECTED (node $" << std::hex << std::uppercase << next
+					<< std::dec << " already visited), stopping to avoid an infinite loop.\n";
+				break;
+			}
+			visited.push_back(next);
+			r1 = next;
+			++count;
+
+			const auto f2 = _mem.get(dsp56k::MemArea_X, r1 + 0x2);
+			const auto f3 = _mem.get(dsp56k::MemArea_X, r1 + 0x3);
+			const auto f27 = _mem.get(dsp56k::MemArea_X, r1 + 0x27);
+			const auto f126 = _mem.get(dsp56k::MemArea_X, r1 + 0x126);
+			_out << "  node " << count << ": addr=X:$" << std::hex << std::uppercase << r1
+				<< "  +$2=$" << f2 << "  +$3=$" << f3 << "  +$27=$" << f27
+				<< "  +$126(primary-back-ptr)=$" << f126 << std::dec << "\n";
+		}
+		_out << "TOTAL ACTIVE-VOICE NODES: " << count << "\n";
+	}
+
+	struct Experiment
+	{
+		std::string name;
+		uint32_t paramOffset;   // byte offset into TPreset (page*128+index)
+		const char* paramLabel;
+		bool wantNonZero;       // true = engaged (test), false = disengaged (control)
+		uint8_t patchValue;     // value to force if no matching factory preset is found
+
+		// If set, don't rely on the bulk preset upload to engage the parameter -- instead
+		// send a real live PARAM_CHANGE SysEx (F0 00 20 33 01 <devId> <page> <part> <param>
+		// <value> F7, per virusLib/microcontroller.cpp's sendSysex PAGE_A..PAGE_D handling)
+		// AFTER a note is already sounding, exactly like a front-panel knob turn would.
+		bool useLiveParamChange = false;
+		uint8_t livePage = 0;   // e.g. 0x71 = PAGE_B
+		uint8_t liveParam = 0;  // raw per-page parameter index (NOT the page*128+index byte offset)
+		uint8_t liveValue = 0;
+		// Audio callback count at which to send the live PARAM_CHANGE. Default (700) is well
+		// after Note On (sent at cb 512) -- mimics "note already sounding, then turn the knob".
+		// Set below 512 (e.g. 400) to send it *before* Note On instead -- mimics "turn the knob,
+		// then play a note", which is the more common real-world case and exercises the voice
+		// allocator's initial read of the parameter rather than any live re-evaluation path.
+		uint32_t liveParamCallback = 700;
+
+		// If >= 0, skip the "first matching preset" search below and load this exact bank/
+		// program instead (still must satisfy the param condition -- this is just for picking
+		// a *specific* one of several matches, e.g. to diff the Vocoder slot table across
+		// multiple genuinely different Vocoder-engaged presets found via "vocoder_scan").
+		int forcedBank = -1;
+		int forcedProgram = -1;
+
+		// If true, send a SECOND Note On a few audio callbacks after the first (chord, not
+		// unison) -- a structural sanity check that the linked-list walk itself can produce a
+		// node count > 1 under a condition guaranteed to allocate multiple voices, independent of
+		// whatever Unison Mode does or doesn't do. If this comes back at 1 node too, that would
+		// mean the walk logic (or its termination-condition assumption) is wrong, not that
+		// polyphony/unison isn't duplicating voices.
+		bool secondNoteOn = false;
+		uint8_t secondNoteNumber = 64;
+		uint32_t secondNoteCallback = 520; // must be > the first Note On's cb 512
+	};
+
+	// Known preset byte offsets (page*128+index), from source/osTIrusJucePlugin/parameterDescriptions_TI.json:
+	//   Vocoder Mode:  page 113 (PAGE_B=0x71->offset 1)  idx 39  -> 1*128+39  = 167
+	//   Unison Mode:   page 111 (PAGE_6F=0x6f->offset 3)  idx 120 -> 3*128+120 = 504
+	const Experiment kExperiments[] = {
+		{ "vocoder", 167, "Vocoder Mode", true, 1 },
+		// Second, genuinely different Vocoder-engaged factory preset, for slot-table diffing --
+		// "vocoder_scan" found only two factory presets with Vocoder Mode != 0 in this ROM:
+		// bank 11/124 "VocoPad XM" (VocoderMode=1, the default "vocoder" experiment above) and
+		// bank 16/97 "SplddVOCJL" (VocoderMode=2 -- a different vocoder *type/algorithm*, not
+		// just different band/frequency settings, per the "vocoderMode" toText enum in
+		// parameterDescriptions_TI.json -- min:0 max:6).
+		{ "vocoder2", 167, "Vocoder Mode", true, 1, false, 0, 0, 0, 700, 16, 97 },
+		{ "control", 167, "Vocoder Mode", false, 0 },
+		{ "unison", 504, "Unison Mode", true, 1 },
+		{ "unison_control", 504, "Unison Mode", false, 0 },
+		// Same Unison Mode test, but engaged via a real live PARAM_CHANGE SysEx after the
+		// note is already sounding, instead of baking the byte into the bulk preset upload --
+		// the "unison"/"unison_control" pair above came back byte-for-byte identical, and the
+		// leading theory is that the bulk-upload path doesn't trigger whatever re-evaluation
+		// a live parameter change does. Unison Mode is page 111 = raw SysEx page byte
+		// PAGE_6F=0x6f (per the offset table above), index 120, value 1 ("Twin").
+		// NB: an earlier draft of this line used 0x71/39, which is actually Vocoder Mode
+		// (page 113/PAGE_B idx 39, see the "vocoder" experiment above) -- caught and fixed
+		// by cross-checking against parameterDescriptions_TI.json before this was ever run.
+		{ "unison_live", 504, "Unison Mode", false, 0, true, 0x6f, 120, 1 },
+		// Control for the control: send the exact same live PARAM_CHANGE SysEx (same page/part/
+		// param, same timing at cb 700) but with value=0 -- i.e. a live no-op, since the base
+		// preset's Unison Mode byte is already 0. If this comes back identical to plain
+		// "unison_control" (no SysEx sent at all), that isolates "unison_live"'s differences
+		// (if any) as caused by the 0->1 transition specifically, not merely by the DSP
+		// processing *any* live PARAM_CHANGE command at that tick.
+		{ "unison_live_control", 504, "Unison Mode", false, 0, true, 0x6f, 120, 0 },
+		// Third variant: send the live PARAM_CHANGE *before* Note On (cb 400, vs. the default
+		// 700 which is well after cb 512's Note On) -- "turn the unison knob, then play a note",
+		// exercising the voice allocator's initial read of the parameter at note-on time, rather
+		// than a live re-evaluation of an already-sounding voice (which "unison_live" above
+		// showed produces no unison-specific effect in the probed region at all -- see findings).
+		{ "unison_live_pretrigger", 504, "Unison Mode", false, 0, true, 0x6f, 120, 1, 400 },
+		// Control for the above: same cb-400 pretrigger timing, but value=0 (no-op).
+		{ "unison_live_pretrigger_control", 504, "Unison Mode", false, 0, true, 0x6f, 120, 0, 400 },
+		// Isolating control: does *any* live PARAM_CHANGE sent at cb 400 (pretrigger timing)
+		// perturb the $54132-$54135 list-traversal globals / $566B9 scatter-table slot a little,
+		// purely from generic command-dispatch timing jitter, regardless of which parameter or
+		// value is written? Uses Portamento Time (page 112/PAGE_A idx 5), value 0 vs 50 -- a
+		// parameter with no plausible connection to voice allocation/unison. If this pair shows
+		// the same small residual diff "unison_live_pretrigger" showed vs its own value=0
+		// control, that confirms the residual is generic jitter, not unison-specific.
+		// Portamento Time preset byte offset: page 112/PAGE_A(0x70)->offset 0, idx 5 -> offset 5.
+		{ "inert_param_live_pretrigger_control", 5, "Portamento Time (inert)", false, 0, true, 0x70, 5, 0, 400 },
+		{ "inert_param_live_pretrigger", 5, "Portamento Time (inert)", false, 0, true, 0x70, 5, 50, 400 },
+		// Structural sanity check for the active-voice linked-list walk added this session (see
+		// dumpVoiceLinkedList above): Unison Mode == 0 (base preset, no live SysEx at all), but
+		// send a SECOND Note On (note 64, a major third above the first note 60) at cb 520, 8
+		// audio callbacks after the first Note On at cb 512 -- i.e. a genuine 2-note chord, no
+		// unison involved. This is guaranteed (assuming the preset is polyphonic, which "64Degee
+		// MS" is by default) to result in 2 independently-allocated voices, so the linked list
+		// MUST show 2 nodes here if the walk logic is correct. If this also comes back at 1 node,
+		// that indicts the walk itself (wrong head-cell/sentinel assumption, wrong per-node
+		// offset, or reading at the wrong time) rather than telling us anything about unison.
+		{ "chord_2note", 504, "Unison Mode (unused -- chord sanity check)", false, 0, false, 0, 0, 0, 700, -1, -1, true, 64, 520 },
+	};
+}
+
+int main(int _argc, char* _argv[])
+{
+	const std::string modeArg = _argc > 1 ? _argv[1] : "vocoder";
+
+	// Enumeration-only mode: list every factory preset with Vocoder Mode != 0, plus a couple of
+	// other vocoder-relevant byte values (Vocoder/Bands: page 112/PAGE_A idx 58 -> preset offset
+	// 58; Filter Select: page 113/PAGE_B idx 122 -> preset offset 1*128+122=250), so we can pick
+	// presets that differ in secondary vocoder params for the slot-table diffing experiment below.
+	// Does not boot the DSP -- pure ROM/preset-table scan, exits immediately after listing.
+	if (modeArg == "vocoder_scan")
+	{
+		auto rom = ROMLoader::findROM(DeviceModel::TI2);
+		if (!rom.isValid())
+		{
+			std::cout << "ROM not found/invalid." << std::endl;
+			return 1;
+		}
+		for (uint32_t b = 1; b < 26; ++b)
+		{
+			for (uint32_t p = 0; p < rom.getPresetsPerBank(); ++p)
+			{
+				Microcontroller::TPreset data;
+				if (!rom.getSingle(static_cast<int>(b), static_cast<int>(p), data))
+					continue;
+				if (data.size() <= 250 || data[167] == 0)
+					continue;
+				std::cout << "bank " << b << " program " << p << " \"" << ROMFile::getSingleName(data)
+					<< "\" VocoderMode=" << static_cast<int>(data[167])
+					<< " Bands=" << static_cast<int>(data[58])
+					<< " FilterSelect=" << static_cast<int>(data[250]) << std::endl;
+			}
+		}
+		return 0;
+	}
+
+	// Re-check (this session) the earlier finding that no factory preset in the ROM ships with
+	// Unison Mode != 0 (preset offset 504) -- if one exists, per the task brief it's a more
+	// realistic test than a hand-forced live SysEx/bulk patch. Pure ROM/preset-table scan, same
+	// shape as "vocoder_scan" above, doesn't boot the DSP.
+	if (modeArg == "unison_scan")
+	{
+		auto rom = ROMLoader::findROM(DeviceModel::TI2);
+		if (!rom.isValid())
+		{
+			std::cout << "ROM not found/invalid." << std::endl;
+			return 1;
+		}
+		int found = 0;
+		for (uint32_t b = 1; b < 26; ++b)
+		{
+			for (uint32_t p = 0; p < rom.getPresetsPerBank(); ++p)
+			{
+				Microcontroller::TPreset data;
+				if (!rom.getSingle(static_cast<int>(b), static_cast<int>(p), data))
+					continue;
+				if (data.size() <= 504 || data[504] == 0)
+					continue;
+				++found;
+				std::cout << "bank " << b << " program " << p << " \"" << ROMFile::getSingleName(data)
+					<< "\" UnisonMode=" << static_cast<int>(data[504]) << std::endl;
+			}
+		}
+		std::cout << "Total factory presets with Unison Mode != 0: " << found << std::endl;
+		return 0;
+	}
+
+	const Experiment* exp = nullptr;
+	for (const auto& e : kExperiments)
+	{
+		if (e.name == modeArg)
+		{
+			exp = &e;
+			break;
+		}
+	}
+	if (!exp)
+	{
+		std::cout << "Unknown mode \"" << modeArg << "\". Known modes: vocoder_scan unison_scan";
+		for (const auto& e : kExperiments)
+			std::cout << " " << e.name;
+		std::cout << std::endl;
+		return 1;
+	}
+	const std::string outFile = "xmem_" + exp->name + "_dump.txt";
+
+	auto rom = ROMLoader::findROM(DeviceModel::TI2);
+	if (!rom.isValid())
+	{
+		std::cout << "ROM not found/invalid. Place a valid TI2 firmware .bin next to this executable." << std::endl;
+		return 1;
+	}
+	std::cout << "Using ROM " << rom.getFilename() << " -- experiment \"" << exp->name << "\" ("
+		<< exp->paramLabel << (exp->wantNonZero ? " != 0" : " == 0") << ")" << std::endl;
+
+	// Find a factory single preset matching this experiment's parameter condition.
+	int foundBank = -1, foundProgram = -1;
+	Microcontroller::TPreset preset{};
+	if (exp->forcedBank >= 0)
+	{
+		Microcontroller::TPreset data;
+		if (rom.getSingle(exp->forcedBank, exp->forcedProgram, data) && data.size() > exp->paramOffset)
+		{
+			foundBank = exp->forcedBank;
+			foundProgram = exp->forcedProgram;
+			preset = data;
+			std::cout << "Forced preset: bank " << foundBank << " program " << foundProgram
+				<< " (\"" << ROMFile::getSingleName(preset) << "\"), " << exp->paramLabel << " byte = "
+				<< static_cast<int>(preset[exp->paramOffset]) << std::endl;
+		}
+		else
+		{
+			std::cout << "Forced bank/program " << exp->forcedBank << "/" << exp->forcedProgram
+				<< " invalid, falling back to search." << std::endl;
+		}
+	}
+	// Skip bank 0 -- program 0 there turned out to be a blank/init template preset
+	// (garbled name) whose degenerate parameter values crash the emulator's DSP core.
+	// Not otherwise relevant to this experiment, so just avoid it.
+	for (uint32_t b = 1; b < 26 && foundBank < 0; ++b)
+	{
+		for (uint32_t p = 0; p < rom.getPresetsPerBank(); ++p)
+		{
+			Microcontroller::TPreset data;
+			if (!rom.getSingle(static_cast<int>(b), static_cast<int>(p), data))
+				continue;
+			if (data.size() <= exp->paramOffset)
+				continue;
+			const bool wantMatch = exp->wantNonZero ? (data[exp->paramOffset] != 0) : (data[exp->paramOffset] == 0);
+			if (wantMatch)
+			{
+				foundBank = static_cast<int>(b);
+				foundProgram = static_cast<int>(p);
+				preset = data;
+				std::cout << "Found preset: bank " << foundBank << " program " << foundProgram
+					<< " (\"" << ROMFile::getSingleName(preset) << "\"), " << exp->paramLabel << " byte = "
+					<< static_cast<int>(preset[exp->paramOffset]) << std::endl;
+				break;
+			}
+		}
+	}
+
+	if (foundBank < 0)
+	{
+		std::cout << "No matching factory preset found. Falling back to preset 1/0, patching " << exp->paramLabel << "." << std::endl;
+		rom.getSingle(1, 0, preset);
+		if (preset.size() > exp->paramOffset)
+			preset[exp->paramOffset] = exp->wantNonZero ? exp->patchValue : 0;
+		std::cout << "Using preset \"" << ROMFile::getSingleName(preset) << "\"" << std::endl;
+	}
+
+	DspSingle* dsp1raw = nullptr;
+	DspSingle* dsp2raw = nullptr;
+	virusLib::Device::createDspInstances(dsp1raw, dsp2raw, rom, static_cast<float>(rom.getSamplerate()));
+	std::unique_ptr<DspSingle> dsp1(dsp1raw);
+
+	Microcontroller uc(*dsp1, rom, false);
+	if (dsp2raw)
+		uc.addDSP(*dsp2raw, false);
+
+	dsp56k::SpscSemaphore sem(1);
+	uint32_t callbackCount = 0;
+	int32_t notifyTimeout = 0;
+	constexpr uint32_t blockSize = 64;
+	const uint32_t notifyThreshold = blockSize > 4 ? blockSize - 4 : 0;
+	std::vector<SMidiEvent> midiEvents; // touched only from the audio-callback thread below
+
+	bool presetSent = false;
+	bool noteSent = false;
+	bool liveParamSent = false;
+	bool secondNoteSent = false;
+
+	auto& esai = dsp1->getAudio();
+	esai.setCallback([&](dsp56k::Audio*)
+	{
+		const auto availableSize = esai.getAudioOutputs().size();
+		const auto sizeReached = availableSize >= notifyThreshold;
+		--notifyTimeout;
+		if (notifyTimeout <= 0 && sizeReached)
+		{
+			notifyTimeout = static_cast<int>(notifyThreshold);
+			sem.notify();
+		}
+
+		++callbackCount;
+		if ((callbackCount & 0x3) != 0)
+			return;
+
+		uc.readMidiOut(midiEvents);
+		const auto audioCallbackCount = callbackCount >> 2;
+		uc.process();
+
+		if (audioCallbackCount == 1)
+		{
+			dsp1->drainESSI1();
+			uc.sendInitControlCommands(127);
+		}
+		else if (audioCallbackCount == 256 && !presetSent)
+		{
+			dsp1->drainESSI1();
+			dsp1->disableESSI1();
+			std::cout << "[cb " << audioCallbackCount << "] Sending preset" << std::endl;
+			uc.writeSingle(BankNumber::EditBuffer, virusLib::SINGLE, preset);
+			presetSent = true;
+		}
+		else if (audioCallbackCount == 512 && !noteSent)
+		{
+			std::cout << "[cb " << audioCallbackCount << "] Sending Note On" << std::endl;
+			uc.sendMIDI(SMidiEvent(MidiEventSource::Host, 0x90, 60, 0x5f));
+			uc.sendPendingMidiEvents(std::numeric_limits<uint32_t>::max());
+			noteSent = true;
+		}
+		else if (audioCallbackCount == exp->secondNoteCallback && exp->secondNoteOn && !secondNoteSent)
+		{
+			std::cout << "[cb " << audioCallbackCount << "] Sending SECOND Note On (note "
+				<< static_cast<int>(exp->secondNoteNumber) << ")" << std::endl;
+			uc.sendMIDI(SMidiEvent(MidiEventSource::Host, 0x90, exp->secondNoteNumber, 0x5f));
+			uc.sendPendingMidiEvents(std::numeric_limits<uint32_t>::max());
+			secondNoteSent = true;
+		}
+		else if (audioCallbackCount == exp->liveParamCallback && exp->useLiveParamChange && !liveParamSent)
+		{
+			std::cout << "[cb " << audioCallbackCount << "] Sending live PARAM_CHANGE: page=0x"
+				<< std::hex << static_cast<int>(exp->livePage) << " param=" << std::dec
+				<< static_cast<int>(exp->liveParam) << " value=" << static_cast<int>(exp->liveValue)
+				<< std::endl;
+			synthLib::SysexBuffer sysex{
+				0xf0, 0x00, 0x20, 0x33, 0x01, 0x00,
+				exp->livePage, virusLib::SINGLE, exp->liveParam, exp->liveValue,
+				0xf7
+			};
+			std::vector<SMidiEvent> responses;
+			uc.sendSysex(sysex, responses, MidiEventSource::Host);
+			liveParamSent = true;
+		}
+	});
+
+	virusLib::Device::bootDSPs(dsp1.get(), dsp2raw, rom, false);
+
+	// Render several seconds' worth of audio (discarded to a throwaway wav) purely to
+	// drive the DSP thread forward in real time -- we only care about the resulting
+	// DSP-internal memory state, not the audio content itself.
+	// 8s: comfortably past note-on (cb 512) AND, for live-param experiments, past the
+	// cb-700 PARAM_CHANGE send, with several seconds of settle time after it.
+	constexpr uint32_t kMaxSampleCount = 8 * 44100;
+	AudioProcessor proc(rom.getSamplerate(), "xmem_vocoder_probe_throwaway.wav", false, kMaxSampleCount, dsp1.get(), dsp2raw);
+
+	std::cout << "Booted. Rendering ~5s of audio to drive the engine forward..." << std::endl;
+
+	while (!proc.finished())
+	{
+		sem.wait();
+		proc.processBlock(blockSize);
+		// Deliberately NOT touching midiEvents here -- it's only ever written from the
+		// audio-callback thread (uc.readMidiOut above); clearing it from this thread too,
+		// as ConsoleApp::run() does, is an unsynchronized cross-thread race (hit a SIGBUS
+		// from it during testing). We don't consume midiEvents' contents in this probe, so
+		// simply never touching it from this thread is the simplest safe fix.
+	}
+
+	std::cout << "Done processing. Dumping X-memory of interest..." << std::endl;
+
+	auto& mem = dsp1->getMemory();
+
+	std::ofstream out(outFile);
+	std::ostream& o = out;
+
+	o << "Mode: " << exp->name << " (" << exp->paramLabel << (exp->wantNonZero ? " != 0" : " == 0") << ")\n";
+	o << "Preset used: bank " << foundBank << " program " << foundProgram
+		<< " name=\"" << ROMFile::getSingleName(preset) << "\"\n";
+	o << exp->paramLabel << " byte (preset offset " << exp->paramOffset << ") = "
+		<< static_cast<int>(preset[exp->paramOffset]) << "\n\n";
+
+	dumpRange(mem, dsp56k::MemArea_X, "x", 0xb50, 8, o);      // ownership-claim flags neighborhood
+	dumpRange(mem, dsp56k::MemArea_Y, "y", 0x48293, 1, o);    // DSP-role strap
+	dumpRange(mem, dsp56k::MemArea_X, "x", 0x54130, 8, o);    // list-traversal tracking globals ($54131-$54136)
+	// doc/dsp56300_synth_engine.md's harmonic-engine section: $49940 = active slot count
+	// (derived from voice +$94), $49942 = table running pointer, $49943/$49944 and $49947/$49948
+	// = two (accumulator, delta) channel pairs.
+	dumpRange(mem, dsp56k::MemArea_X, "x", 0x49940, 10, o);
+
+	// X:$b52 is documented as an ownership-claim pointer, not a fixed table base -- follow
+	// it live rather than assuming the static-image template address (0x49800).
+	const auto b52 = mem.get(dsp56k::MemArea_X, 0xb52);
+	o << "\nX:$b52 = $" << std::hex << std::uppercase << b52 << std::dec << " -- ";
+	if (b52 != 0)
+	{
+		o << "nonzero, following it as a pointer (dumping 320 words = 32 slots x 10 words, "
+			"per the documented table shape):\n";
+		dumpRange(mem, dsp56k::MemArea_X, "x", b52, 320, o);
+		// Also dump some words *before* the pointer in case it points mid-structure or the
+		// header precedes the slot array.
+		if (b52 >= 16)
+			dumpRange(mem, dsp56k::MemArea_X, "x", b52 - 16, 16, o);
+	}
+	else
+	{
+		o << "zero / unclaimed, nothing to follow.\n";
+	}
+
+	// Also dump the static-image template region for reference/comparison.
+	dumpRange(mem, dsp56k::MemArea_X, "x", 0x49800, 32, o);
+
+	if (exp->name == "unison" || exp->name == "unison_control" ||
+		exp->name == "unison_live" || exp->name == "unison_live_control" ||
+		exp->name == "unison_live_pretrigger" || exp->name == "unison_live_pretrigger_control" ||
+		exp->name == "inert_param_live_pretrigger" || exp->name == "inert_param_live_pretrigger_control" ||
+		exp->name == "chord_2note")
+	{
+		// func_00024c ("resolve my primary voice") caches the resolved primary's +$2 field
+		// here, and one confirmed caller scatters a per-tick value into a primary-+$27-indexed
+		// slot of this 66-word table -- see doc/dsp56300_synth_engine.md.
+		dumpRange(mem, dsp56k::MemArea_X, "x", 0x54136, 1, o);
+		dumpRange(mem, dsp56k::MemArea_X, "x", 0x56684, 66, o);
+
+		// The direct structural test this session was added for: walk the active-voice linked
+		// list itself and report its node count/pointers, rather than only the secondary
+		// tracking globals above (which the prior session's unison_live* runs already showed no
+		// unison-specific signal in).
+		dumpVoiceLinkedList(mem, o);
+		
+		o << "--- X:$1F38 area ---\n";
+		for(int i=0; i<8; i++) {
+			o << "  X:$" << std::hex << (0x1F38 + i) << " = $" << mem.get(dsp56k::MemArea_X, 0x1F38 + i) << "\n";
+		}
+		o << "--- Voice Node $49B9E ---\n";
+		dumpRange(mem, dsp56k::MemArea_X, "x", 0x49B9E, 64, o);
+	}
+
+	out.close();
+	std::cout << "Wrote " << outFile << std::endl;
+
+	return 0;
+}

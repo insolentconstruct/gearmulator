@@ -1,0 +1,28 @@
+--- dsp56300/gearmulator/source/xmemProbe/xmemProbe.cpp
++++ dsp56300/gearmulator/source/xmemProbe/xmemProbe.cpp
+@@ -412,24 +412,6 @@
+ 		if (audioCallbackCount == 1)
+ 		{
+ 			dsp1->drainESSI1();
+ 			uc.sendInitControlCommands(127);
+-			
+-			std::vector<SMidiEvent> responses;
+-			// Disable Arp globally (Page 0x73, Index 0x1a = 26, Value 0)
+-			synthLib::SysexBuffer s1a{0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x73, 0x40, 0x1a, 0x01, 0xf7};
+-			uc.sendSysex(s1a, responses, MidiEventSource::Host);
+-			synthLib::SysexBuffer s1b{0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x73, 0x40, 0x1a, 0x00, 0xf7};
+-			uc.sendSysex(s1b, responses, MidiEventSource::Host);
+-			
+-			// Disable Delay (Page 0x73, Index 0x1b = 27, Value 0)
+-			synthLib::SysexBuffer s2a{0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x73, 0x40, 0x1b, 0x01, 0xf7};
+-			uc.sendSysex(s2a, responses, MidiEventSource::Host);
+-			synthLib::SysexBuffer s2b{0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x73, 0x40, 0x1b, 0x00, 0xf7};
+-			uc.sendSysex(s2b, responses, MidiEventSource::Host);
+-			
+-			// Disable Reverb (Page 0x73, Index 0x1c = 28, Value 0)
+-			synthLib::SysexBuffer s3a{0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x73, 0x40, 0x1c, 0x01, 0xf7};
+-			uc.sendSysex(s3a, responses, MidiEventSource::Host);
+-			synthLib::SysexBuffer s3b{0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x73, 0x40, 0x1c, 0x00, 0xf7};
+-			uc.sendSysex(s3b, responses, MidiEventSource::Host);
+ 		}
+ 		else if (audioCallbackCount == 256 && !presetSent)

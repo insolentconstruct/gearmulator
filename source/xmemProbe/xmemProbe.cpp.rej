@@ -1,0 +1,12 @@
+@@ -531,6 +531,11 @@
+ 
+ 		dumpVoiceLinkedList(dsp1->getMemory(), out);
+ 
++		out << "--- X:$1F38 area ---\n";
++		for(int i=0; i<8; i++) {
++			out << "  X:$" << std::hex << (0x1F38 + i) << " = $" << dsp1->getMemory().get(dsp56k::EMemArea::X, 0x1F38 + i) << "\n";
++		}
++
+ 		out.close();
+ 		std::cout << "Wrote xmem_" << exp->name << "_dump.txt\n";
+ 	}

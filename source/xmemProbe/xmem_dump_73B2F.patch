@@ -1,0 +1,12 @@
+--- dsp56300/gearmulator/source/xmemProbe/xmemProbe.cpp
++++ dsp56300/gearmulator/source/xmemProbe/xmemProbe.cpp
+@@ -539,6 +539,9 @@
+ 		
+ 		o << "--- Voice Node $49B9E ---\n";
+ 		dumpRange(mem, dsp56k::MemArea_X, "x", 0x49B9E, 64, o);
++		
++		o << "--- Voice Node $73B2F ---\n";
++		dumpRange(mem, dsp56k::MemArea_X, "x", 0x73B2F, 64, o);
+ 	}
+ 
+ 	out.close();

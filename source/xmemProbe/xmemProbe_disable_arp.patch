@@ -1,0 +1,16 @@
+--- dsp56300/gearmulator/source/xmemProbe/xmemProbe.cpp
++++ dsp56300/gearmulator/source/xmemProbe/xmemProbe.cpp
+@@ -434,6 +434,13 @@
+ 		if (audioCallbackCount == 1)
+ 		{
+ 			dsp1->drainESSI1();
+ 			uc.sendInitControlCommands(127);
++			
++			// Disable Arp globally (Page 0x73, Index 0x1a = 26, Value 0)
++			uc.sendMIDI(SMidiEvent(MidiEventSource::Host, 0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x10, 0x73, 0x1a, 0x00, 0xf7));
++			// Disable Delay (Page 0x73, Index 0x1b = 27, Value 0)
++			uc.sendMIDI(SMidiEvent(MidiEventSource::Host, 0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x10, 0x73, 0x1b, 0x00, 0xf7));
++			// Disable Reverb (Page 0x73, Index 0x1c = 28, Value 0)
++			uc.sendMIDI(SMidiEvent(MidiEventSource::Host, 0xf0, 0x00, 0x20, 0x33, 0x01, 0x10, 0x10, 0x73, 0x1c, 0x00, 0xf7));
+ 		}
+ 		else if (audioCallbackCount == 256 && !presetSent)

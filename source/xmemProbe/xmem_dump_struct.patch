@@ -1,0 +1,12 @@
+--- dsp56300/gearmulator/source/xmemProbe/xmemProbe.cpp
++++ dsp56300/gearmulator/source/xmemProbe/xmemProbe.cpp
+@@ -536,6 +536,9 @@
+ 		for(int i=0; i<8; i++) {
+ 			out << "  X:$" << std::hex << (0x1F38 + i) << " = $" << dsp1->getMemory().get(dsp56k::EMemArea::X, 0x1F38 + i) << "\n";
+ 		}
++		
++		out << "--- Voice Node $49B9E ---\n";
++		dumpRange(dsp1->getMemory(), dsp56k::MemArea_X, "x", 0x49B9E, 10, out);
+ 
+ 		out.close();
+ 		std::cout << "Wrote xmem_" << exp->name << "_dump.txt\n";
