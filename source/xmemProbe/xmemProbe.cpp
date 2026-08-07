@@ -1799,7 +1799,21 @@ namespace
 		//         "no routing change" from "a routing change this statistic cannot see" (e.g. the
 		//         built VM program's CONTENT changing at fixed addresses). Dumping P content gives
 		//         a second, independent observable over the same arms.
-		const std::vector<std::pair<uint32_t, uint32_t>>& _pdumpRanges = {})
+		const std::vector<std::pair<uint32_t, uint32_t>>& _pdumpRanges = {},
+		// 2026-08-07, ADDITIVE. --icache-model <base>: enable the DSP56300 instruction-cache model
+		// on both DSPs for this run, with <base> as the first CACHEABLE program address. 0 = off,
+		// so a run without the flag is bit-identical to every earlier run of this mode.
+		//
+		// The base is REQUIRED and has no default here for the same reason it has none in
+		// DSP::setInstructionCacheModel: it is a per-part, per-OMR/SR property (DSP56367 with the
+		// TI2's OMR=$204080/SR=$880000 -> $001c00), and a wrong base silently makes internal
+		// program RAM cacheable, which FM Rev. 5 chapter 8 says never happens.
+		//
+		// The model is INTERPRETER-ONLY and setInstructionCacheModel THROWS in a JIT build, so this
+		// flag cannot be used to produce the false-negative reading it exists to avoid: under the
+		// JIT no sector is ever allocated (Memory::getOpcode bypasses the cache) and dmaWritesStale
+		// would read 0 by construction. The throw is caught below and reported as a refusal.
+		dsp56k::TWord _icacheBase = 0)
 	{
 		auto rom = ROMLoader::findROM(DeviceModel::TI2);
 		if (!rom.isValid())
@@ -1890,6 +1904,37 @@ namespace
 		{
 			tracker2 = std::make_unique<ExecTracker>(dsp2raw->getDSP(), "dsp2");
 			dsp2raw->getDSP().setDebugger(tracker2.get());
+		}
+
+		// --icache-model. Enabled at exactly the point the debugger is attached -- after
+		// createDspInstances and before the DSP threads are driven -- which is the lifetime point
+		// this mode has always used and is therefore already known to be race-free here.
+		//
+		// Printed unconditionally, including the OFF case, so that no log can be mistaken for the
+		// other configuration. This is the same rule the liveParams line above follows, and it
+		// exists because the counters below are meaningless without knowing whether the model ran.
+		if (_icacheBase)
+		{
+			try
+			{
+				dsp1->getDSP().setInstructionCacheModel(true, _icacheBase);
+				if (dsp2raw)
+					dsp2raw->getDSP().setInstructionCacheModel(true, _icacheBase);
+			}
+			catch (const std::exception& e)
+			{
+				std::cout << "pc_coverage: --icache-model REFUSED: " << e.what() << std::endl;
+				std::cout << "pc_coverage: exiting 4 rather than running with the model off and "
+					"reporting counters that would read 0 by construction." << std::endl;
+				return 4;
+			}
+			std::cout << "pc_coverage: icacheModel = ON, first cacheable program address $"
+				<< std::hex << _icacheBase << std::dec << std::endl;
+		}
+		else
+		{
+			std::cout << "pc_coverage: icacheModel = OFF (ideal always-coherent machine; the "
+				"instruction-cache counters printed at the end are NOT a measurement)" << std::endl;
 		}
 
 		dsp56k::SpscSemaphore sem(1);
@@ -2100,6 +2145,49 @@ namespace
 		dsp1->getDSP().setDebugger(nullptr);
 		if (dsp2raw)
 			dsp2raw->getDSP().setDebugger(nullptr);
+
+		// --- instruction-cache counters, 2026-08-07 ------------------------------------------
+		//
+		// dmaWritesToP answers the question left open on 2026-08-03 (work/icache_selfmod_coherency
+		// section "Next step"): does any DMA channel in the TI2 firmware EVER target program space?
+		// It is counted with the model off and outside the CE/base gate (dsp.cpp), so a 0 here is
+		// unambiguous -- it does not mean "below the cacheable base" or "with CE clear".
+		//
+		// dmaWritesStale is the only counter that requires the model, and it requires a FETCH to
+		// have allocated the sector first, so `fetches` is printed next to it as the anti-vacuity
+		// number. fetches == 0 with the model on means the run never fetched a cacheable address
+		// and the staleness figure says nothing at all. That combination is what a JIT build would
+		// have produced silently before setInstructionCacheModel started refusing one.
+		for (auto* d : { dsp1.get(), dsp2raw })
+		{
+			if (!d)
+				continue;
+			const auto& s = d->getDSP().getInstructionCacheStats();
+			const bool on = d->getDSP().getInstructionCacheModel();
+			std::cout << "ICACHE " << (d == dsp1.get() ? "dsp1" : "dsp2")
+				<< ": model=" << (on ? "ON" : "off")
+				<< " fetches=" << s.fetches
+				<< " fetchHits=" << s.fetchHits
+				<< " pmovewHits=" << s.pmovewHits
+				<< " pmovewMisses=" << s.pmovewMisses
+				<< " dmaWritesToP=" << s.dmaWritesToP
+				<< " dmaWritesToPCacheable=" << s.dmaWritesToPCacheable
+				<< " dmaWritesToPResident=" << s.dmaWritesToPResident
+				<< " dmaWritesStale=" << s.dmaWritesStale
+				<< std::hex << " dmaWriteToPRange=$" << s.dmaWriteToPMin << "-$" << s.dmaWriteToPMax << std::dec
+				<< " pflush=" << s.pflush
+				<< " pflushun=" << s.pflushun
+				<< " pfree=" << s.pfree
+				<< " plock=" << s.plock
+				<< " punlock=" << s.punlock
+				<< std::endl;
+
+			if (on && s.fetches == 0)
+				std::cout << "ICACHE " << (d == dsp1.get() ? "dsp1" : "dsp2")
+					<< ": VACUOUS -- the model was on but no cacheable address was ever fetched, so "
+					"dmaWritesStale=" << s.dmaWritesStale << " is a fact about this run's reach, "
+					"not about the firmware." << std::endl;
+		}
 
 		// TEMPORARY INSTRUMENTATION 2026-08-01 -- the measurement the claim ledger names as the
 		// one that settles row 81: is the alias target nonzero at the end of a render?
@@ -5847,6 +5935,7 @@ int main(int _argc, const char* _argv[])
 		int watchdogSecs = 0;
 		bool sweepControls = true;
 		bool jitControl = false;						// T19 2026-08-02, --jit-control
+		dsp56k::TWord icacheBase = 0;					// 2026-08-07, --icache-model <base>, 0 = off
 		std::vector<std::array<uint8_t, 3>> liveParams;	// T12 2026-08-02, --param page:idx:value
 		std::vector<std::pair<uint32_t, uint32_t>> pdumpRanges;	// 2026-08-02, --pdump lo:hi
 		for (int i = 2; i < _argc; ++i)
@@ -5866,6 +5955,24 @@ int main(int _argc, const char* _argv[])
 				sweepControls = false;
 			else if (arg == "--jit-control")
 				jitControl = true;
+			else if (arg == "--icache-model" && i + 1 < _argc)
+			{
+				// The first CACHEABLE program address. Base 0 parsing with a trailing-garbage
+				// check, same contract as --pdump: a bare "1c00" would parse as decimal 1900 and
+				// quietly move the boundary, which is the exact class of misparse this mode's
+				// --pdump comment already records paying for. Write 0x1c00.
+				const std::string spec = _argv[++i];
+				size_t n = 0;
+				const unsigned long v = std::stoul(spec, &n, 0);
+				if (n != spec.size() || v == 0)
+				{
+					std::cout << "pc_coverage: --icache-model wants a nonzero first-cacheable "
+						"program address (use 0x-prefixed hex, e.g. 0x1c00 for the TI2), got \""
+						<< spec << "\"" << std::endl;
+					return 1;
+				}
+				icacheBase = static_cast<dsp56k::TWord>(v);
+			}
 			else if (arg == "--preset" && i + 1 < _argc)
 			{
 				const std::string spec = _argv[++i];
@@ -5941,7 +6048,7 @@ int main(int _argc, const char* _argv[])
 		if (presets.empty())
 			presets = { {11, 124} }; // "VocoPad XM", this project's standard known-good trigger
 		return runPcCoverage(outPrefix, presets, slot, sweepControls, maxSamples, firstSlot, watchdogSecs,
-			liveParams, jitControl, pdumpRanges);
+			liveParams, jitControl, pdumpRanges, icacheBase);
 	}
 
 	// Enumeration-only mode: list every factory preset with Vocoder Mode != 0, plus a couple of
