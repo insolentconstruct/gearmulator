@@ -1110,12 +1110,59 @@ namespace
 			// implementation that shares none of our assumptions.
 			dumpRange(mem, dsp56k::MemArea_Y, "Y", 0x040082, 160, out);
 			dumpRange(mem, dsp56k::MemArea_Y, "Y", 0x0453b0, 16, out);
+			// ADDED 2026-09-08 -- THE HOST-PROTOCOL STATE MACHINE (claim-ledger row 176).
+			// The HDI08 receive ISR (P:$0060 -> func_05237D) files each host word into one of two
+			// rings and dispatches every drained byte through `jsge (r2)` with r2 loaded from
+			// X:$482C0. That pointer, its saved copies, the walker's cursor and the state TABLES
+			// are all RUNTIME RAM: ti2.X.bin covers only X:$0-$1FB6 and ti2.Y.bin only
+			// Y:$0-$453BD, so every one of these addresses is BEYOND the static images and the
+			// reachable state set is provably unclosable without executing the firmware. That is
+			// the ladder-rung-2 case CLAUDE.md describes; nothing here touches hardware.
+			//
+			// X:$482B8+16 spans $482BD/$482BE/$482BF (the flags the ring drains test), $482C0
+			// (the live handler pointer), and $482C1/$482C2 (its saved copies).
+			dumpRange(mem, dsp56k::MemArea_X, "X", 0x0482b8, 16, out);
+			// Y:$482E0+24 spans the walker cursor $482E4 and the two roots $482EE/$482F0 that
+			// func_05259A is entered with from $052569 and $052578.
+			dumpRange(mem, dsp56k::MemArea_Y, "Y", 0x0482e0, 24, out);
+			// The other two roots, from $054ED1 and $054EEA.
+			dumpRange(mem, dsp56k::MemArea_Y, "Y", 0x054ed0, 16, out);
+			dumpRange(mem, dsp56k::MemArea_Y, "Y", 0x054ef0, 16, out);
+			// ROUND 2, 2026-09-08: the NODE REGION, so the graph can be WALKED rather than
+			// sampled. The first dump showed the roots hold handler $0525AF with links to
+			// Y:$482F2 and Y:$48307, the cursor y:$482E4 = $48327, and further node pointers
+			// $48316 and $4834E -- all inside $48300-$4835F. 96 words covers the whole cluster
+			// in one pass so a second rebuild is not needed to follow one more link.
+			dumpRange(mem, dsp56k::MemArea_Y, "Y", 0x048300, 96, out);
 			dumpRange(mem, dsp56k::MemArea_P, "P", 0x000b0e, 8, out);
 			dumpRange(mem, dsp56k::MemArea_X, "X", 0x000b0e, 8, out);
 			dumpRange(mem, dsp56k::MemArea_P, "P", 0x000c00, 8, out);
 			dumpRange(mem, dsp56k::MemArea_X, "X", 0x000c00, 8, out);
 			dumpRange(mem, dsp56k::MemArea_P, "P", 0x001e70, 16, out);
 			dumpRange(mem, dsp56k::MemArea_X, "X", 0x001e70, 16, out);
+			// X:$52058 -- THE SAMPLE-RATE SELECTOR, added 2026-08-12.
+			// doc/port_algorithm_inventory.md gives it a section of its own: it has NO VISIBLE
+			// WRITER in the static graph, and it decides three separate questions -- the 32 kHz
+			// EQ-band candidate, the X:$484b7 enumeration, and which rate is actually live.
+			// "fs = 44100 is in force" was REFUTED on 2026-08-12
+			// (work/falsify/pitch-closed-form-fs-cancels.verdict.md C2), so every Hz figure in the
+			// Vowel, Comb, Pitch and EQ/Phaser rows is either conditional on an unestablished rate
+			// or has been rewritten to cite an algebraic cancellation instead.
+			// No existing dump range came near it -- the X ranges stopped at $1e70 -- so the cell
+			// has never been observed, only reasoned about. A window rather than a single word,
+			// because a neighbour that moves with it is evidence and a lone value is not.
+			dumpRange(mem, dsp56k::MemArea_X, "X", 0x052050, 24, out);
+			// AND THE SAME WINDOW IN Y, added 2026-08-12 AFTER a cross-vendor pass REFUTED the
+			// conclusion drawn from the X dump alone: the code writes `y:>$52058`, the first dump
+			// read MemArea_X, and the X window returned P-image content for every unwritten word.
+			// So "X:$52058 = $0 at boot" could not establish the live selector's value.
+			// work/falsify/rate-table-six-rates.verdict.md C5 (REFUTED).
+			dumpRange(mem, dsp56k::MemArea_Y, "Y", 0x052050, 24, out);
+			// The rate table itself, so the selected row is visible beside the selector rather
+			// than inferred from the static image. $484b8-$484d3 inclusive is 28 words = 7 rows
+			// of 4; $484b4-$484b7 are the four cells func_053095 stores the selected row into.
+			dumpRange(mem, dsp56k::MemArea_X, "X", 0x0484b4, 32, out);
+			dumpRange(mem, dsp56k::MemArea_Y, "Y", 0x0484b4, 32, out);
 			dumpRange(mem, dsp56k::MemArea_P, "P", 0x000d0c, 8, out);
 		};
 		while (!proc.finished())
@@ -2729,15 +2776,41 @@ namespace
 			out << "  Arp Mode override=" << _arpMode << " (baked into bulk preset, preset[143])\n";
 		out << "\n";
 
-		// Sanity check per work/chorus_type_findings.md: DSP2_X:$1F41 should hold a distinct
-		// value per chorus type ($25C3FD classic/vintage/vibrato/rotary, $25C3FB hyper, $25C5A6
-		// air) -- confirms the preset[103] write above actually took effect before trusting a
-		// "block sets are identical" result as meaningful rather than a silently-inert sweep.
+		// NOT A SANITY CHECK. The label that stood here until 2026-08-12 printed a VALIDITY
+		// VERDICT this cell cannot support, and the value it printed was correct the whole time --
+		// the number was right and the sentence a reader acts on was false.
+		//
+		// The retired comment read: "DSP2_X:$1F41 should hold a distinct value per chorus type
+		// ($25C3FD classic/vintage/vibrato/rotary, $25C3FB hyper, $25C5A6 air) -- confirms the
+		// preset[103] write above actually took effect before trusting a 'block sets are
+		// identical' result as meaningful rather than a silently-inert sweep." Every clause of
+		// that is superseded, and the correction is already in THIS FILE twelve lines below, in
+		// the chorus_buildarea block, where it has sat since 2026-07-17 without reaching here:
+		//
+		//   * X:$1F41 is a ROTATING CURRENT-SLOT POINTER into a shared 1022-record tap pool at
+		//     X:$BF003-$BFFFA that is byte-identical across chorus types. It is not a per-type
+		//     dispatch pointer, and the $25Cxxx per-type table was single-snapshot readings of a
+		//     rotating value -- a sampling artefact.
+		//     work/dsp_chorus_live_program_matrix_findings.md sections 1 and 5 (2026-07-17).
+		//   * It varies BETWEEN RUNS AT CONSTANT CONFIGURATION, $0 included. Two runs of one
+		//     identical arm: v12 run1 $3BCD74 / run2 $0, and v1 run1 $0 / run2 $3BCD76
+		//     (work/os40_falsify_2026-08-12.md:180). A single snapshot of a value that moves on
+		//     its own cannot validate anything.
+		//     Also work/diffexec_T15_farside_paramcheck_2026-08-02.md lesson 5 ("unstable in this
+		//     harness -- do not inherit that check as validation") and
+		//     work/diffexec_T16_filterbank_rerun_spec_2026-08-02.md section 3.
+		//
+		// So $0 here does NOT mean the run is void, and non-zero does NOT mean it is valid. It is
+		// dumped because the value is real and diffable, not because it certifies anything.
+		// Engagement has to be established some other way -- for the live-PARAM_CHANGE path that
+		// means the block-set evidence itself, not this cell.
 		if (dsp2raw)
 		{
-			const auto dispatchPtr = dsp2raw->getMemory().get(dsp56k::MemArea_X, 0x1F41);
-			out << "Sanity check: DSP2_X:$1F41 (chorus_type_findings.md's dispatch pointer) = $"
-				<< std::hex << std::uppercase << dispatchPtr << std::dec << "\n\n";
+			const auto tapSlotPtr = dsp2raw->getMemory().get(dsp56k::MemArea_X, 0x1F41);
+			out << "X:$1F41 rotating tap-slot pointer = $"
+				<< std::hex << std::uppercase << tapSlotPtr << std::dec
+				<< "  -- NOT an engagement or validity check: this cell varies run-to-run at"
+				   " constant configuration, $0 included. Do not read $0 as a void run.\n\n";
 		}
 
 		// chorus_buildarea mode (work/dsp_vm_program_catalog_findings.md item 6.1): the live
@@ -3095,12 +3168,16 @@ namespace
 		if (dsp2raw)
 		{
 			auto& mem2 = dsp2raw->getMemory();
-			// Sanity check re-borrowed from chorus_pc_trace: confirms the cold Program Change
-			// actually landed on a Chorus-bearing preset (any nonzero/known dispatch value here
-			// proves SOME real single loaded, not a blank/failed program-change no-op).
-			const auto dispatchPtr = mem2.get(dsp56k::MemArea_X, 0x1F41);
-			out << "Sanity check: DSP2_X:$1F41 (chorus_type_findings.md's dispatch pointer) = $"
-				<< std::hex << std::uppercase << dispatchPtr << std::dec << "\n";
+			// NOT A SANITY CHECK -- the same false label retired at the runChorusPcTrace site
+			// on 2026-08-12, and this copy inherited it verbatim. The retired claim was that "any
+			// nonzero/known dispatch value here proves SOME real single loaded, not a blank/failed
+			// program-change no-op". X:$1F41 is a rotating tap-slot pointer that moves run-to-run
+			// at constant configuration and reads $0 on runs that are fine, so it proves neither
+			// direction. See the long note at the runChorusPcTrace site for the evidence.
+			const auto tapSlotPtr = mem2.get(dsp56k::MemArea_X, 0x1F41);
+			out << "X:$1F41 rotating tap-slot pointer = $"
+				<< std::hex << std::uppercase << tapSlotPtr << std::dec
+				<< "  -- NOT an engagement or validity check; $0 does not mean the load failed\n";
 			out << "--- dsp2 Site1 stub-cluster probe (Y:$16/$23/$40-$4F) ---\n";
 			dumpRange(mem2, dsp56k::MemArea_Y, "dsp2_y", 0x16, 1, out);
 			dumpRange(mem2, dsp56k::MemArea_Y, "dsp2_y", 0x23, 1, out);
@@ -3444,9 +3521,12 @@ namespace
 		if (dsp2raw)
 		{
 			auto& mem2 = dsp2raw->getMemory();
-			const auto dispatchPtr = mem2.get(dsp56k::MemArea_X, 0x1F41);
-			out << "Sanity check: DSP2_X:$1F41 (chorus_type_findings.md's dispatch pointer) = $"
-				<< std::hex << std::uppercase << dispatchPtr << std::dec << "\n";
+			// Label retired 2026-08-12 along with the other two sites: X:$1F41 is a rotating
+			// tap-slot pointer, not a dispatch pointer, and not a validity verdict of any kind.
+			const auto tapSlotPtr = mem2.get(dsp56k::MemArea_X, 0x1F41);
+			out << "X:$1F41 rotating tap-slot pointer = $"
+				<< std::hex << std::uppercase << tapSlotPtr << std::dec
+				<< "  -- NOT an engagement or validity check\n";
 			out << "--- dsp2 Site1 stub-cluster probe (Y:$16/$23/$40-$4F) ---\n";
 			dumpRange(mem2, dsp56k::MemArea_Y, "dsp2_y", 0x16, 1, out);
 			dumpRange(mem2, dsp56k::MemArea_Y, "dsp2_y", 0x23, 1, out);
